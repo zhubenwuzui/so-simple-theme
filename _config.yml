@@ -7,8 +7,8 @@ description: 空气变了，风景变了，规则也变了.
 search: true
 destination: ../zhubenwuzui.github.io
 url: http://lida.pw
-url: http://0.0.0.0:4000
-url: http://localhost:4000
+# url: http://0.0.0.0:4000
+# url: http://localhost:4000
 
 
 
