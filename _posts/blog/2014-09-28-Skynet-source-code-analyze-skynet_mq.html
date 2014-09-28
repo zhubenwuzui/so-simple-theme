@@ -1,0 +1,432 @@
+---
+layout: post
+category: blog
+title: skynet_mq 源码分析
+excerpt: 这是我在阅读skynet源码中做的一些笔记,肯定会有什么地方理解错了,希望朋友们可以帮忙指出.
+---
+<div id="table-of-contents">
+<h2>Table of Contents</h2>
+<div id="text-table-of-contents">
+<ul>
+<li><a href="#sec-1">1. 涉及到的一些原子操作</a></li>
+<li><a href="#sec-2">2. 一些宏</a></li>
+<li><a href="#sec-3">3. message_queue</a></li>
+<li><a href="#sec-4">4. global_queue</a></li>
+<li><a href="#sec-5">5. skynet_globalmq_push</a></li>
+<li><a href="#sec-6">6. skynet_globalmq_pop</a></li>
+<li><a href="#sec-7">7. globalmq push和pop总结</a></li>
+</ul>
+</div>
+</div>
+
+
+<div id="outline-container-sec-1" class="outline-2">
+<h2 id="sec-1"><span class="section-number-2">1</span> 涉及到的一些原子操作</h2>
+<div class="outline-text-2" id="text-1">
+<p>
+参考资料:
+<a href="http://pic.dhe.ibm.com/infocenter/compbg/v121v141/index.jsp?topic=/com.ibm.xlcpp121.bg.doc/compiler_ref/bif_gcc_atomic_bool_comp_swap.html">http://pic.dhe.ibm.com/infocenter/compbg/v121v141/index.jsp?topic=/com.ibm.xlcpp121.bg.doc/compiler_ref/bif_gcc_atomic_bool_comp_swap.html</a>
+初步阅读部分代码,发现云风实现的这个mq是无锁结构,好久没有碰原子操作的这一系列API了,查了一下资料,这里列出skynet_mq.c中所用到的原子操作函数的相关说明
+</p>
+
+<ul class="org-ul">
+<li>T __sync_fetch_and_add (T* __p, U __v, &#x2026;);
+</li>
+</ul>
+
+<p>
+在p指向的值上面加上v,然后返回p指向的值之前的值,翻译成普通代码就是:
+</p>
+<div class="org-src-container">
+
+<pre class="src src-c">tmp = *__p;
+*__p += __v;
+<span style="color: #728a05;">return</span> tmp;
+</pre>
+</div>
+<ul class="org-ul">
+<li>bool __sync_bool_compare_and_swap (T* __p, U __compVal, V __exchVal, &#x2026;);
+</li>
+</ul>
+
+<p>
+比较__p指向的值是否和__compVal相等,如果相等就把__exchVal赋值给__P所指向的地址,并返回true,否则返回false
+</p>
+
+<p>
+翻译成普通代码就是:
+</p>
+<div class="org-src-container">
+
+<pre class="src src-c"><span style="color: #728a05;">if</span> (*__p == __compVal) {
+   *__p = __exchVal;
+   <span style="color: #728a05;">return</span> <span style="color: #259185;">true</span>;
+}
+<span style="color: #728a05;">return</span> <span style="color: #259185;">false</span>;
+</pre>
+</div>
+<ul class="org-ul">
+<li>T __sync_lock_test_and_set (T* __p, U __v, &#x2026;);
+</li>
+</ul>
+
+<p>
+__v赋值给__p所指向的地址,并且返回__p所指向的地址在赋值操作之前的值.
+</p>
+
+<p>
+翻译成普通代码就是:
+</p>
+<div class="org-src-container">
+
+<pre class="src src-c">tmp = *__p;
+*__p = __v;
+<span style="color: #728a05;">return</span> tmp;
+</pre>
+</div>
+<ul class="org-ul">
+<li>void __sync_lock_release (T* __p, &#x2026;);
+</li>
+</ul>
+
+<p>
+设置__p所指向的值为0.
+</p>
+</div>
+</div>
+
+<div id="outline-container-sec-2" class="outline-2">
+<h2 id="sec-2"><span class="section-number-2">2</span> 一些宏</h2>
+<div class="outline-text-2" id="text-2">
+<div class="org-src-container">
+
+<pre class="src src-c"><span style="color: #bd3612;">#define</span> <span style="color: #2075c7;">LOCK</span>(<span style="color: #2075c7;">q</span>) <span style="color: #728a05;">while</span> (__sync_lock_test_and_set(&amp;(q)-&gt;lock,1)) {} <span style="color: #81908f; font-style: italic;">//</span><span style="color: #81908f; font-style: italic;">&#19981;&#20572;&#30340;&#32473;q-&gt;lock&#36171;&#20540;&#20026;1,&#20572;&#27490;&#26465;&#20214;&#23601;&#26159; &#36171;&#20540;&#20026;1&#20043;&#21069;q-&gt;lock&#30340;&#20540;&#20026;0</span>
+<span style="color: #bd3612;">#define</span> <span style="color: #2075c7;">UNLOCK</span>(<span style="color: #2075c7;">q</span>) __sync_lock_release(&amp;(q)-&gt;lock);<span style="color: #81908f; font-style: italic;">// </span><span style="color: #81908f; font-style: italic;">&#35774;&#32622;q-&gt;lock&#30340;&#20540;&#20026;0</span>
+</pre>
+</div>
+
+<div class="org-src-container">
+
+<pre class="src src-c"><span style="color: #bd3612;">#define</span> <span style="color: #2075c7;">GP</span>(<span style="color: #2075c7;">p</span>) ((p) % MAX_GLOBAL_MQ)
+</pre>
+</div>
+</div>
+</div>
+
+<div id="outline-container-sec-3" class="outline-2">
+<h2 id="sec-3"><span class="section-number-2">3</span> message_queue</h2>
+<div class="outline-text-2" id="text-3">
+<div class="org-src-container">
+
+<pre class="src src-c"><span style="color: #728a05;">struct</span> <span style="color: #a57705;">message_queue</span> {
+    <span style="color: #a57705;">uint32_t</span> <span style="color: #2075c7;">handle</span>;
+    <span style="color: #a57705;">int</span> <span style="color: #2075c7;">cap</span>;
+    <span style="color: #a57705;">int</span> <span style="color: #2075c7;">head</span>;
+    <span style="color: #a57705;">int</span> <span style="color: #2075c7;">tail</span>;
+    <span style="color: #a57705;">int</span> <span style="color: #2075c7;">lock</span>;
+    <span style="color: #a57705;">int</span> <span style="color: #2075c7;">release</span>;
+    <span style="color: #a57705;">int</span> <span style="color: #2075c7;">in_global</span>;
+    <span style="color: #728a05;">struct</span> <span style="color: #a57705;">skynet_message</span> *<span style="color: #2075c7;">queue</span>;
+    <span style="color: #728a05;">struct</span> <span style="color: #a57705;">message_queue</span> *<span style="color: #2075c7;">next</span>;
+};
+</pre>
+</div>
+<p>
+message_queue是一个单向链表,用于存储push到global_mq时失败的mq
+</p>
+</div>
+</div>
+
+<div id="outline-container-sec-4" class="outline-2">
+<h2 id="sec-4"><span class="section-number-2">4</span> global_queue</h2>
+<div class="outline-text-2" id="text-4">
+<p>
+先来看一下定义:
+</p>
+<div class="org-src-container">
+
+<pre class="src src-c"><span style="color: #728a05;">struct</span> <span style="color: #a57705;">global_queue</span> {
+    <span style="color: #a57705;">uint32_t</span> <span style="color: #2075c7;">head</span>;
+    <span style="color: #a57705;">uint32_t</span> <span style="color: #2075c7;">tail</span>;
+    <span style="color: #728a05;">struct</span> <span style="color: #a57705;">message_queue</span> ** <span style="color: #2075c7;">queue</span>;
+    <span style="color: #81908f; font-style: italic;">// </span><span style="color: #81908f; font-style: italic;">We use a separated flag array to ensure the mq is pushed.</span>
+    <span style="color: #81908f; font-style: italic;">// </span><span style="color: #81908f; font-style: italic;">See the comments below.</span>
+    <span style="color: #728a05;">struct</span> <span style="color: #a57705;">message_queue</span> *<span style="color: #2075c7;">list</span>;
+};
+</pre>
+</div>
+<p>
+head 和 tail是 queue的索引,考虑到溢出的情况(head &gt;= GLOBAL_MAX_MQ 或者 tail &gt;= GLOBAL_MAX_MQ),于是就是用GP来对其取模,实现循环队列
+</p>
+</div>
+</div>
+<div id="outline-container-sec-5" class="outline-2">
+<h2 id="sec-5"><span class="section-number-2">5</span> skynet_globalmq_push</h2>
+<div class="outline-text-2" id="text-5">
+<p>
+看函数名的意思应该是向globalmq中push一个message_queue.尝试分析一下代码:
+</p>
+<div class="org-src-container">
+
+<pre class="src src-c"><span style="color: #a57705;">void</span> 
+<span style="color: #2075c7;">skynet_globalmq_push</span>(<span style="color: #728a05;">struct</span> <span style="color: #a57705;">message_queue</span> * <span style="color: #2075c7;">queue</span>) {
+    <span style="color: #728a05;">struct</span> <span style="color: #a57705;">global_queue</span> *<span style="color: #2075c7;">q</span>= Q;
+
+    <span style="color: #a57705;">uint32_t</span> <span style="color: #2075c7;">tail</span> = GP(__sync_fetch_and_add(&amp;q-&gt;tail,1));
+
+    <span style="color: #81908f; font-style: italic;">// </span><span style="color: #81908f; font-style: italic;">only one thread can set the slot (change q-&gt;queue[tail] from NULL to queue)</span>
+    <span style="color: #728a05;">if</span> (<span style="color: #c60007;">!</span>__sync_bool_compare_and_swap(&amp;q-&gt;queue[tail], <span style="color: #259185;">NULL</span>, queue)) {
+        <span style="color: #81908f; font-style: italic;">// </span><span style="color: #81908f; font-style: italic;">The queue may full seldom, save queue in list</span>
+        assert(queue-&gt;next == <span style="color: #259185;">NULL</span>);
+        <span style="color: #728a05;">struct</span> <span style="color: #a57705;">message_queue</span> * <span style="color: #2075c7;">last</span>;
+        <span style="color: #728a05;">do</span> {
+            last = q-&gt;list;<span style="color: #81908f; font-style: italic;">//</span><span style="color: #81908f; font-style: italic;">save the global_queue q-&gt;list into var last first</span>
+            queue-&gt;next = last; <span style="color: #81908f; font-style: italic;">//</span><span style="color: #81908f; font-style: italic;">last var save into the pushed queue's next</span>
+        } <span style="color: #728a05;">while</span>(<span style="color: #c60007;">!</span>__sync_bool_compare_and_swap(&amp;q-&gt;list, last, queue));
+        <span style="color: #728a05;">return</span>;
+    }
+}
+</pre>
+</div>
+<p>
+首先把全局变量指针Q复制到当前堆栈:
+</p>
+<pre class="example">
+struct global_queue *q= Q;
+</pre>
+<p>
+然后计算出q-&gt;tail的hash值并且把q-&gt;tail+=1,并且要保证这两个操作是一个原子操作,所以使用了原子操作函数__sync_fetch_and_add
+</p>
+<pre class="example">
+uint32_t tail = GP(__sync_fetch_and_add(&amp;q-&gt;tail,1));
+</pre>
+<p>
+现在,q-&gt;queue[tail]就是global_mq中的最后一个了.
+接下来判断q-&gt;queue[tail]是否为NULL
+</p>
+<ul class="org-ul">
+<li>为NULL
+</li>
+</ul>
+<p>
+此时的做法很简单,只需要把push进来的queue赋值给q-&gt;queue[tail]就行了.
+</p>
+<pre class="example">
+if (!__sync_bool_compare_and_swap(&amp;q-&gt;queue[tail], NULL, queue)) {
+</pre>
+<p>
+__sync_bool_compare_and_swap会返回true,该if进不去,所以就直接return出该函数了,实际上在这个原子操作返回true之前,queue已经赋值给q-&gt;queue[tail]了,这里如果不使用原子操作,代码应该是:
+</p>
+<div class="org-src-container">
+
+<pre class="src src-c"><span style="color: #a57705;">bool</span> <span style="color: #2075c7;">ret</span>;
+<span style="color: #728a05;">if</span> (q-&gt;queue[tail] == <span style="color: #259185;">NULL</span>){
+   q-&gt;queue[tail] = queue;
+   ret = <span style="color: #259185;">true</span>;
+}
+ret = <span style="color: #259185;">false</span>;
+<span style="color: #728a05;">if</span> (ret)
+   ...
+</pre>
+</div>
+<ul class="org-ul">
+<li>不为NULL
+</li>
+</ul>
+<p>
+表示目前在Global队列中的queue已经超过64个了,这时再push是push不进去的,所以把它暂存到q-&gt;list中,这就是message_queue中next的作用了
+</p>
+
+<p>
+这时候就进入到if里面的代码了,这里的插入操作和单线程的写法有区别,应该是为了实现无锁多线程才这么写的,我个人理解是这样的:
+</p>
+
+<p>
+if内的代码是多个线程都可以同时访问到的,q-&gt;list这个变量,随时都有可能发生改变,通过__sync_bool_compare_and_swap来保证 do 到 while之间的操作是原子的,中间别的线程没有写入q-&gt;list
+</p>
+
+<div class="org-src-container">
+
+<pre class="src src-c"><span style="color: #728a05;">do</span> {
+    last = q-&gt;list; <span style="color: #81908f; font-style: italic;">//</span><span style="color: #81908f; font-style: italic;">&#20808;&#21462;&#20986;q-&gt;list&#30340;&#20540;&#23384;&#21040;last&#37324;&#38754;</span>
+    queue-&gt;next = last; <span style="color: #81908f; font-style: italic;">//</span><span style="color: #81908f; font-style: italic;">&#20877;&#25226;last&#36171;&#20540;&#32473;queue-&gt;next</span>
+} <span style="color: #728a05;">while</span>(<span style="color: #c60007;">!</span>__sync_bool_compare_and_swap(&amp;q-&gt;list, last, queue)); <span style="color: #81908f; font-style: italic;">//</span><span style="color: #81908f; font-style: italic;">&#21028;&#26029;&#20043;&#21069;&#23384;&#21040;last&#30340;&#20540;&#26159;&#21542;&#36824;&#31561;&#20110;q-&gt;list,&#22914;&#26524;&#19981;&#26159;,&#21017;&#37325;&#26032;&#25191;&#34892;&#36825;&#19968;&#36807;&#31243;.</span>
+</pre>
+</div>
+
+<p>
+不考虑多线程的话,这里的代码可以这么写:
+</p>
+
+<div class="org-src-container">
+
+<pre class="src src-c">queue-&gt;next = q-&gt;list;
+q-&gt;list = queue;
+</pre>
+</div>
+</div>
+</div>
+
+<div id="outline-container-sec-6" class="outline-2">
+<h2 id="sec-6"><span class="section-number-2">6</span> skynet_globalmq_pop</h2>
+<div class="outline-text-2" id="text-6">
+<p>
+pop操作和push操作对应,先来看一下代码
+</p>
+<div class="org-src-container">
+
+<pre class="src src-c"><span style="color: #2075c7;">skynet_globalmq_pop</span>() {
+    <span style="color: #728a05;">struct</span> <span style="color: #a57705;">global_queue</span> *<span style="color: #2075c7;">q</span> = Q;
+    <span style="color: #a57705;">uint32_t</span> <span style="color: #2075c7;">head</span> =  q-&gt;head;
+
+    <span style="color: #728a05;">if</span> (head == q-&gt;tail) {
+        <span style="color: #81908f; font-style: italic;">// </span><span style="color: #81908f; font-style: italic;">The queue is empty.</span>
+        <span style="color: #728a05;">return</span> <span style="color: #259185;">NULL</span>;
+    }
+
+    <span style="color: #a57705;">uint32_t</span> <span style="color: #2075c7;">head_ptr</span> = GP(head);
+
+    <span style="color: #728a05;">struct</span> <span style="color: #a57705;">message_queue</span> * <span style="color: #2075c7;">list</span> = q-&gt;list;
+    <span style="color: #728a05;">if</span> (list) {
+        <span style="color: #81908f; font-style: italic;">// </span><span style="color: #81908f; font-style: italic;">If q-&gt;list is not empty, try to load it back to the queue</span>
+        <span style="color: #728a05;">struct</span> <span style="color: #a57705;">message_queue</span> *<span style="color: #2075c7;">newhead</span> = list-&gt;next;
+        <span style="color: #728a05;">if</span> (__sync_bool_compare_and_swap(&amp;q-&gt;list, list, newhead)) {
+            <span style="color: #81908f; font-style: italic;">// </span><span style="color: #81908f; font-style: italic;">try load list only once, if success , push it back to the queue.</span>
+            list-&gt;next = <span style="color: #259185;">NULL</span>;
+            skynet_globalmq_push(list);
+        }
+    }
+
+    <span style="color: #728a05;">struct</span> <span style="color: #a57705;">message_queue</span> * <span style="color: #2075c7;">mq</span> = q-&gt;queue[head_ptr];
+    <span style="color: #728a05;">if</span> (mq == <span style="color: #259185;">NULL</span>) {
+        <span style="color: #81908f; font-style: italic;">// </span><span style="color: #81908f; font-style: italic;">globalmq push not complete</span>
+        <span style="color: #728a05;">return</span> <span style="color: #259185;">NULL</span>;
+    }
+    <span style="color: #728a05;">if</span> (<span style="color: #c60007;">!</span>__sync_bool_compare_and_swap(&amp;q-&gt;head, head, head+1)) {
+        <span style="color: #728a05;">return</span> <span style="color: #259185;">NULL</span>;
+    }
+    <span style="color: #81908f; font-style: italic;">// </span><span style="color: #81908f; font-style: italic;">only one thread can get the slot (change q-&gt;queue[head_ptr] to NULL)</span>
+    <span style="color: #728a05;">if</span> (<span style="color: #c60007;">!</span>__sync_bool_compare_and_swap(&amp;q-&gt;queue[head_ptr], mq, <span style="color: #259185;">NULL</span>)) {
+        <span style="color: #728a05;">return</span> <span style="color: #259185;">NULL</span>;
+    }
+
+    <span style="color: #728a05;">return</span> mq;
+}
+</pre>
+</div>
+<p>
+首先判断 queue是否为空,然后计算出head索引,然后检查q-&gt;list中有没有数据,如果有数据就尝试push到global_mq中,因为每次pop只弹出一个message_queue,所以这里也只尝试一次从list中取出一个message_queue push进 global_mq中.
+</p>
+
+<p>
+接着判断head_ptr所指向的queue是否有效,如果为NULL则直接返回NULL.
+</p>
+<div class="org-src-container">
+
+<pre class="src src-c"><span style="color: #728a05;">if</span> (<span style="color: #c60007;">!</span>__sync_bool_compare_and_swap(&amp;q-&gt;head, head, head+1)) {
+    <span style="color: #728a05;">return</span> <span style="color: #259185;">NULL</span>;
+}
+</pre>
+</div>
+<p>
+这行代码保证,同时有多个线程运行到这里时,有且只有一个线程会运行下去,其他的线程都会在这里return.
+</p>
+
+<p>
+如果涉及到多个线程访问,推演起来比较复杂,我尝试列了一个表来模拟如果有两个线程同时执行到这里可能发生的冲突.
+</p>
+
+<table border="2" cellspacing="0" cellpadding="6" rules="groups" frame="hsides">
+
+
+<colgroup>
+<col  class="left" />
+
+<col  class="left" />
+</colgroup>
+<tbody>
+<tr>
+<td class="left">thread1</td>
+<td class="left">thread2</td>
+</tr>
+
+<tr>
+<td class="left">head = q-&gt;head = 1</td>
+<td class="left">head = q-&gt;head = 1</td>
+</tr>
+
+<tr>
+<td class="left">head_ptr = GP(head) = 1</td>
+<td class="left">head_ptr = GP(head) = 1</td>
+</tr>
+
+<tr>
+<td class="left">if (!__sync_bool_compare_and_swap(&amp;q-&gt;head, head, head+1)) {</td>
+<td class="left">if (!__sync_bool_compare_and_swap(&amp;q-&gt;head, head, head+1)) {</td>
+</tr>
+
+<tr>
+<td class="left">true, q-&gt;head is 2</td>
+<td class="left">false, return.</td>
+</tr>
+
+<tr>
+<td class="left">if (!__sync_bool_compare_and_swap(&amp;q-&gt;queue[head_ptr], mq, NULL)) {</td>
+<td class="left">once again</td>
+</tr>
+
+<tr>
+<td class="left">&#xa0;</td>
+<td class="left">head = q-&gt;head = 2</td>
+</tr>
+
+<tr>
+<td class="left">&#xa0;</td>
+<td class="left">head_ptr = GP(head) = 2</td>
+</tr>
+
+<tr>
+<td class="left">&#xa0;</td>
+<td class="left">if (!__sync_bool_compare_and_swap(&amp;q-&gt;head, head, head+1)) {</td>
+</tr>
+
+<tr>
+<td class="left">&#xa0;</td>
+<td class="left">true</td>
+</tr>
+
+<tr>
+<td class="left">&#xa0;</td>
+<td class="left">now q-&gt;head = 3</td>
+</tr>
+
+<tr>
+<td class="left">head_ptr still 1</td>
+<td class="left">head_ptr is 2</td>
+</tr>
+
+<tr>
+<td class="left">pop 1</td>
+<td class="left">pop 2</td>
+</tr>
+</tbody>
+</table>
+
+<p>
+这里不得不感叹云大功底之深,我等望尘莫及呀.
+</p>
+</div>
+</div>
+
+<div id="outline-container-sec-7" class="outline-2">
+<h2 id="sec-7"><span class="section-number-2">7</span> globalmq push和pop总结</h2>
+<div class="outline-text-2" id="text-7">
+<p>
+分析以上两个函数,不难看出,global_mq实际上是一个循环队列,push的时候tail+=1,pop的时候head+=1,通过GP(tail)和GP(head)索引指向queue的地址.如果tail == head则表示队列已满,此时把需要push的队列放到一个额外的list中,然后每次pop时就尝试push该list中的一个元素到global_mq.
+</p>
+
+<p>
+本身的逻辑应该就是这么简单,代码看上去复杂,就是因为做了无锁的线程安全,就这一块看得让人头晕,不过理解了代码的思路之后,感觉就是拨开云雾见明月啊.
+</p>
+</div>
+</div>
