@@ -2,12 +2,16 @@
 
 title: 小猪的碎碎念
 locale: zh_CN
-description: 猪笨无罪的博客.
-logo: site-logo.png
+description: 空气变了，风景变了，规则也变了.
+# logo: site-logo.png
 search: true
-url: http://0.0.0.0:4000
+destination: ../zhubenwuzui.github.io
 url: http://lida.pw
+url: http://0.0.0.0:4000
 url: http://localhost:4000
+
+
+
 
 
 # Jekyll configuration
